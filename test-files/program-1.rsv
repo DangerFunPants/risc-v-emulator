@@ -1,0 +1,22 @@
+.L3:
+lw      x12, 0(x10)
+addi    x10, x10, 4
+nop
+add     x13, x13, x12
+slt     x14, x11, x10
+nop
+nop
+beq     x14, x0, .L3
+addi    x28, x0, 28
+addi    x29, x0, 29
+addi    x30, x0, 30
+addi    x31, x0, 31
+nop
+nop
+nop
+nop
+halt
+nop
+nop
+nop
+nop

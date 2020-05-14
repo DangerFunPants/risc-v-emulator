@@ -1,0 +1,15 @@
+beq     x0, x0, .L1
+addi    x12, x0, 12
+addi    x13, x0, 13
+addi    x14, x0, 14
+addi    x15, x0, 15
+.L1:
+nop
+nop
+nop
+nop
+halt
+nop
+nop
+nop
+nop

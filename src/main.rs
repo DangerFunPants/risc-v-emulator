@@ -1,60 +1,80 @@
 use std::collections::HashMap;
 use std::convert::TryFrom;
+use std::fmt;
 
+use crate::helpers::{get_bits, splice_bits, twos_complement};
 
-enum Rv64VmError {
+mod assembler;
+mod helpers;
+
+#[cfg(tests)]
+mod nom_tests;
+
+#[cfg(tests)]
+mod helper_tests;
+
+#[derive(Debug)]
+pub enum Rv64VmError {
     InvalidRegisterNumber(u16),
     InvalidOpCode(u32),
     InvalidMux2Control(u32),
     InvalidAluControl(u32),
 }
-type Error = Rv64VmError;
 
+type Error = Rv64VmError;
 pub type Result<T> = ::std::result::Result<T, Rv64VmError>;
 
-trait WriteMemory<T> {
-    fn write(self: &mut Self, address: u32, value: T);
-}
-
-trait ReadMemory<T> {
-    fn read(self: &mut Self, address: u32) -> T;
-}
-
+#[derive(Debug, Copy, Clone, PartialEq)]
 enum OpCode {
-    BEQ     = 0b1100011,
-    SW      = 0b0100011,
-    LW      = 0b0000011,
-    ADDI    = 0b0010011,
-    RTYPE   = 0b0110011,
-    HALT    = 0b0000000,
+    BEQ,
+    SW,
+    LW,
+    ADDI,
+    RTYPE,
+    HALT,
 }
 
 impl TryFrom<u32> for OpCode {
     type Error = Rv64VmError;
     fn try_from(code: u32) -> Result<OpCode> {
         Ok(match code {
-            0b1100011 => OpCode::BEQ,
-            0b0100011 => OpCode::SW,
-            0b0000011 => OpCode::LW,
-            0b0010011 => OpCode::ADDI,
-            0b0110011 => OpCode::RTYPE,
-            0b0000000 => OpCode::HALT,
+            0b110_0011 => OpCode::BEQ,
+            0b010_0011 => OpCode::SW,
+            0b000_0011 => OpCode::LW,
+            0b001_0011 => OpCode::ADDI,
+            0b011_0011 => OpCode::RTYPE,
+            0b000_0000 => OpCode::HALT,
             _ => return Err(Rv64VmError::InvalidOpCode(code)),
         })
     }
 }
 
+#[derive(Debug)]
 struct InstructionMemory {
     base_address    : u32,
-    memory          : Vec<u32>,
+    memory          : HashMap<u32, u32>,
     a               : u32,
     rd              : u32,
 }
 
+impl fmt::Display for InstructionMemory {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        for (addr, instruction) in self.memory.iter() {
+            writeln!(f, "0x{:x}: 0x{:x}", addr, instruction);
+        }
+        Ok(())
+    }
+}
+
 impl InstructionMemory {
     fn from_vec(instructions: Vec<u32>, base_address: u32) -> InstructionMemory {
-        InstructionMemory { base_address: base_address
-                          , memory      : instructions
+        let mut instruction_memory = HashMap::new();
+        for (offset, instruction) in instructions.iter().enumerate() {
+            instruction_memory.insert((offset as u32)*4 + base_address, *instruction);
+        }
+
+        InstructionMemory { base_address
+                          , memory      : instruction_memory      
                           , a           : 0
                           , rd          : 0
                           }
@@ -65,29 +85,24 @@ impl InstructionMemory {
     }
 
     fn clock_low(self: &mut Self) {
-        self.rd = self.memory[self.a as usize];
-    }
-
-    fn clock_high(self: &mut Self) {
-
-    }
-}
-
-impl ReadMemory<u32> for InstructionMemory {
-    fn read(self: &mut Self, address: u32) -> u32 {
-        return self.memory[(self.base_address + address) as usize];
+        println!("Instruction memory read location: {:x}", self.a);
+        self.rd = *self.memory.get(&self.a).unwrap();
     }
 }
 
 struct DataMemory {
-    a               : u32,
-    wd              : u32,
-    we              : bool,
-    rd              : u32,
-    memory          : HashMap<u32, u32>,
+    a           : u32,
+    wd          : u32,
+    we          : bool,
+    rd          : u32,
+    memory      : HashMap<u32, u32>,
 }
 
 impl DataMemory {
+    fn new() -> DataMemory {
+        DataMemory {a: 0, wd: 0, we: false, rd: 0, memory: HashMap::new()}
+    }
+
     fn set_a(self: &mut Self, val: u32) {
         self.a = val;
     }
@@ -109,18 +124,31 @@ impl DataMemory {
             self.memory.insert(self.a, self.wd);
         }
     }
+
+    fn initialize_memory(self: &mut Self, addr: u32, val: u32) {
+        self.memory.insert(addr, val);
+    }
 }
 
 struct RegisterFile {
-    registers       : HashMap<u16, u32>,
-    a1              : u16,
-    a2              : u16,
-    a3              : u16,
-    wd3             : u32,
-    we3             : bool,
+    registers   : HashMap<u16, u32>,
+    a1          : u16,
+    a2          : u16,
+    a3          : u16,
+    wd3         : u32,
+    we3         : bool,
 
-    rd_1            : u32,
-    rd_2            : u32,
+    rd_1        : u32,
+    rd_2        : u32,
+}
+
+impl fmt::Display for RegisterFile {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        for (reg_num, reg_val) in self.registers.iter() {
+            writeln!(f, "X{}: 0x{:x}", reg_num, reg_val);
+        }
+        Ok(())
+    }
 }
 
 impl RegisterFile {
@@ -169,15 +197,16 @@ impl RegisterFile {
     }
 
     fn clock_high(self: &mut Self) {
-        if self.we3 {
-            self.registers.insert(self.a3, self.wd3);
-        }
-    }
-
-    // Reads take place on the falling edge of clock cycles. 
-    fn clock_low(self: &mut Self) {
         self.rd_1 = *self.registers.entry(self.a1).or_insert(0);
         self.rd_2 = *self.registers.entry(self.a2).or_insert(0);
+    }
+
+    // Register file updates take place on the falling edge of clock cycles.
+    fn clock_low(self: &mut Self) {
+        if self.we3 {
+            println!("writing {} to register number {}", self.wd3, self.a3);
+            self.registers.insert(self.a3, self.wd3);
+        }
     }
 
     fn initialize_register(self: &mut Self, reg_num: u16, val: u32) {
@@ -186,7 +215,6 @@ impl RegisterFile {
 }
 
 struct Rv64Vm {
-    program_counter     : u32,
     fd_register         : FDRegister,
     de_register         : DERegister,
     em_register         : EMRegister,
@@ -203,19 +231,107 @@ enum Rv64VmState {
 }
 
 impl Rv64Vm {
+    fn from_instructions(instructions: Vec<u32>, base_address: u32) -> Rv64Vm {
+        let imem = InstructionMemory::from_vec(instructions, base_address);
+        let dmem = DataMemory::new();
+        let register_file = RegisterFile::new();
+        let fd_register = FDRegister::new(base_address);
+        let de_register = DERegister::new();
+        let em_register = EMRegister::new();
+        let mw_register = MWRegister::new();
+        let wf_register = WFRegister::new(base_address);
+
+        Rv64Vm { fd_register
+               , de_register
+               , em_register
+               , mw_register
+               , wf_register
+               , instruction_memory: imem
+               , data_memory: dmem
+               , register_file
+               }
+    }
+
+    fn execute_program(self: &mut Self) -> Result<Rv64VmState> {
+        let mut executed_cycles = 0;
+        loop {
+            executed_cycles += 1;
+            println!("************************ Start of Cycle {} ************************", executed_cycles);
+            match self.execute_a_cycle()? {
+                Rv64VmState::Idle => {},
+                Rv64VmState::Halted => break,
+            };
+            println!("************************ End of Cycle {} ************************", executed_cycles);
+        }
+        println!("Executed {} cycles.", executed_cycles);
+        Ok(Rv64VmState::Halted)
+    }
+
     fn execute_a_cycle(self: &mut Self) -> Result<Rv64VmState> {
-        // If we have all the registers already, we should be able to start setting the input
-        // values of all of the registers and memory units. 
+        let is_branch = self.writeback_stage()?;
+        self.fetch_stage();
+        let op_code = self.decode_stage()?;
+        self.execute_stage();
+        self.mem_stage();
         
-        // BEGIN FETCH
-        let pc = self.wf_register.pc_in;
+        if is_branch {
+            self.fd_register.instruction_in = 0x13; // NOP
+
+            self.de_register.reg_write_in = false;
+            self.de_register.mem_write_in = false;
+            self.de_register.branch_in = false;
+
+            self.em_register.mem_write_in = false;
+            self.em_register.reg_write_in = false;
+            self.em_register.branch_in = false;
+
+            self.mw_register.reg_write_in = false;
+            self.em_register.branch_in = false
+        }
+
+        self.fd_register.clock_high();
+        self.de_register.clock_high();
+        self.em_register.clock_high();
+        self.mw_register.clock_high();
+        self.wf_register.clock_high();
+        self.data_memory.clock_high();
+
+        Ok(match op_code {
+            OpCode::HALT => Rv64VmState::Halted,
+            _ => Rv64VmState::Idle,
+        })
+    }
+
+    fn writeback_stage(self: &mut Self) -> Result<bool> {
+        // BEGIN WB
+        println!("Alu out: {:x}", self.mw_register.alu_out_out);
+        let result = mux2(self.mw_register.mem_to_reg_out as u32, self.mw_register.alu_out_out, 
+                          self.mw_register.read_data_out)?;
+        self.register_file.set_a3(self.mw_register.rd_out as u16);
+        self.register_file.set_wd3(result);
+        self.register_file.set_we3(self.mw_register.reg_write_out);
+        self.register_file.clock_low();
+        let and_result = if self.em_register.branch_out && self.em_register.eq_comp_out {1} else {0};
+        // and_result tells us if we should branch or not. 
+        // so if and_result is true we need to invalidate the instructions that are currently in
+        // fetch, decode and execute.
+        println!("branch {} eq_comp {}", self.em_register.branch_out, self.em_register.eq_comp_out);
+        let pc = mux2(and_result, self.wf_register.pc_out + 4, self.em_register.alu_out_out as u32)?;
+        self.wf_register.pc_in = pc;
+        Ok(self.em_register.branch_out && self.em_register.eq_comp_out)
+    }
+
+    fn fetch_stage(self: &mut Self) -> Result<()> {
+        let pc = self.wf_register.pc_out;
         self.instruction_memory.set_a(pc);
         self.instruction_memory.clock_low();
     
-        self.fd_register.pc_in = self.instruction_memory.rd;
-        // END FETCH
-        
-        // BEGIN DECODE
+        self.fd_register.pc_in = pc;
+        self.fd_register.instruction_in = self.instruction_memory.rd;
+        Ok(())
+    }
+
+    fn decode_stage(self: &mut Self) -> Result<OpCode> {
         let instr = self.fd_register.instruction_out;
         let a1 = get_bits(19, 15, instr);
         let a2 = get_bits(24, 20, instr);
@@ -223,21 +339,20 @@ impl Rv64Vm {
         // Don't really know what the better solutions for these casts is?
         self.register_file.set_a1(a1 as u16);
         self.register_file.set_a2(a2 as u16);
-        self.register_file.clock_low();
+        self.register_file.clock_high();
 
         let rd_1 = self.register_file.rd_1;
         let rd_2 = self.register_file.rd_2;
 
-        let inA = get_bits(31, 25, instr);
         let inB = get_bits(14, 12, instr);
         let inC = get_bits(6, 0, instr);
-        
         let op_code = match OpCode::try_from(inC) {
             Ok(op_code) => op_code,
             Err(op_err) => return Err(op_err),
         };
+        println!("op code is {:?}", op_code);
 
-        let (reg_write, mem_to_reg, mem_write, branch, alu_control, alu_src_a, alu_src_b) = 
+        let (reg_write, mem_to_reg, mem_write, branch, alu_control, alu_src_b, alu_src_a) = 
             match op_code {
                 OpCode::BEQ => (false, false, false, true, 0, 1, 0),
                 OpCode::SW => (false, false, true, false, 0, 1, 1),
@@ -247,8 +362,12 @@ impl Rv64Vm {
                 OpCode::HALT => (true, false, false, false, 0, 1, 1),
             };
 
-        let immed = immed_gen(op_code, inA, inB);
-        let rd = get_bits(11, 7, instr);
+        let immed = immed_gen(op_code, get_bits(31, 20, instr), get_bits(11, 0, instr));
+        println!("Immediate value is: {}", immed);
+        let wd = get_bits(11, 7, instr);
+        if op_code == OpCode::BEQ {
+            println!("rd1: {:x}, rd2: {:x}", rd_1, rd_2);
+        }
         
         self.de_register.reg_write_in = reg_write;
         self.de_register.mem_to_reg_in = mem_to_reg;
@@ -257,9 +376,16 @@ impl Rv64Vm {
         self.de_register.alu_control_in = alu_control;
         self.de_register.alu_src_a_in = alu_src_a;
         self.de_register.alu_src_b_in = alu_src_b;
-        // END DECODE
-        
-        // BEGIN EXECUTE
+        self.de_register.pc_in = self.fd_register.pc_out;
+        self.de_register.rd_1_in = rd_1;
+        self.de_register.rd_2_in = rd_2;
+        self.de_register.wd_in = wd;
+        self.de_register.immed_in = immed as u32;
+
+        Ok(op_code)
+    }
+
+    fn execute_stage(self: &mut Self) -> Result<()> {
         let reg_write = self.de_register.reg_write_out;
         let mem_to_reg = self.de_register.mem_to_reg_out;
         let mem_write = self.de_register.mem_write_out;
@@ -269,7 +395,6 @@ impl Rv64Vm {
         let alu_in_a = mux2(self.de_register.alu_src_a_out, self.de_register.pc_out, self.de_register.rd_1_out)?;
         let alu_in_b = mux2(self.de_register.alu_src_b_out, 
                             self.de_register.rd_2_out, self.de_register.immed_out)?;
-
         let alu_out = alu_comp(self.de_register.alu_control_out, alu_in_a as i32, alu_in_b as i32)?;
         let rd_2 = self.de_register.rd_2_out;
         let rd_1 = self.de_register.rd_1_out;
@@ -282,41 +407,26 @@ impl Rv64Vm {
         self.em_register.alu_out_in = alu_out;
         self.em_register.rd_2_in = rd_2;
         self.em_register.rd_in = rd_1;
-        // END EXECUTE
+        self.em_register.wd_in = self.de_register.wd_out;
+        Ok(())
+    }
 
-        // BEGIN MEM
+    fn mem_stage(self: &mut Self) -> Result<()> {
         let reg_write = self.em_register.reg_write_out;
         let mem_to_reg = self.em_register.mem_to_reg_out;
-        let alu_out = self.em_register.alu_out_out;
 
         self.data_memory.set_we(self.em_register.mem_write_out);
         self.data_memory.set_a(self.em_register.alu_out_out as u32);
         self.data_memory.set_wd(self.em_register.rd_2_out);
         self.data_memory.clock_low();
         let read_data = self.data_memory.rd;
-        let rd = self.em_register.rd_out;
 
         self.mw_register.reg_write_in = reg_write;
         self.mw_register.mem_to_reg_in = mem_to_reg;
-        self.mw_register.alu_out_in = alu_out as u32;
+        self.mw_register.alu_out_in = self.em_register.alu_out_out as u32;
         self.mw_register.read_data_in = read_data;
-        self.mw_register.rd_in = rd;
-        // END MEM
-
-        // BEGIN WB
-        let result = mux2(self.mw_register.mem_to_reg_out as bool, self.mw_register.alu_out_out, 
-                          self.mw_register.read_data_out);
-        self.register_file.set_a3(self.mw_register.rd_out);
-        self.register_file.set_wd3(result);
-        self.register_file.set_we3(mw_register.reg_write_out);
-        let and_result = match self.em_register.branch_out & self.em_register.eq_comp_out {
-            0 => false,
-            _ => true;
-        };
-        let pc = mux2(and_result, self.wf_register.pc_out + 4, self.em_register.alu_out_out)?;
-        
-        self.wf_register.pc_in = pc;
-        Ok(Rv64VmState::Idle)
+        self.mw_register.rd_in = self.em_register.wd_out;
+        Ok(())
     }
 }
 
@@ -328,70 +438,200 @@ struct FDRegister {
     instruction_out : u32,
 }
 
-struct DERegister {
-    reg_write_in       : bool,
-    mem_to_reg_in      : bool,
-    mem_write_in       : bool,
-    branch_in          : bool,
-    alu_control_in     : u32,
-    alu_src_a_in       : u32,
-    alu_src_b_in       : u32,
-    pc_in              : u32,
-    rd_1_in            : u32,
-    rd_2_in            : u32,
-    immed_in           : u32,
+impl FDRegister {
+    fn new(base_address: u32) -> FDRegister {
+        FDRegister {pc_in: base_address+4, instruction_in: 0x13, pc_out: 0, instruction_out: 0x13}
+    }
 
-    reg_write_out       : bool,
-    mem_to_reg_out      : bool,
-    mem_write_out       : bool,
-    branch_out          : bool,
-    alu_control_out     : u32,
-    alu_src_a_out       : u32,
-    alu_src_b_out       : u32,
-    pc_out              : u32,
-    rd_1_out            : u32,
-    rd_2_out            : u32,
-    immed_out           : u32,
+    fn clock_high(self: &mut Self) {
+        self.pc_out = self.pc_in;
+        self.instruction_out = self.instruction_in;
+    }
+}
+
+struct DERegister {
+    reg_write_in    : bool,
+    mem_to_reg_in   : bool,
+    mem_write_in    : bool,
+    branch_in       : bool,
+    alu_control_in  : u32,
+    alu_src_a_in    : u32,
+    alu_src_b_in    : u32,
+    pc_in           : u32,
+    rd_1_in         : u32,
+    rd_2_in         : u32,
+    immed_in        : u32,
+    wd_in           : u32,
+
+    reg_write_out   : bool,
+    mem_to_reg_out  : bool,
+    mem_write_out   : bool,
+    branch_out      : bool,
+    alu_control_out : u32,
+    alu_src_a_out   : u32,
+    alu_src_b_out   : u32,
+    pc_out          : u32,
+    rd_1_out        : u32,
+    rd_2_out        : u32,
+    immed_out       : u32,
+    wd_out          : u32,
+}
+
+impl DERegister {
+    fn new() -> DERegister {
+        DERegister { reg_write_in: false
+                   , mem_to_reg_in: false
+                   , mem_write_in: false
+                   , branch_in: false
+                   , alu_control_in: 0
+                   , alu_src_a_in: 0
+                   , alu_src_b_in: 0
+                   , pc_in: 0
+                   , rd_1_in: 0
+                   , rd_2_in: 0
+                   , immed_in: 0
+                   , wd_in: 0
+                   , reg_write_out: false
+                   , mem_to_reg_out: false
+                   , mem_write_out: false
+                   , branch_out: false
+                   , alu_control_out: 0
+                   , alu_src_a_out: 0
+                   , alu_src_b_out: 0
+                   , pc_out: 0
+                   , rd_1_out: 0
+                   , rd_2_out: 0
+                   , immed_out: 0
+                   , wd_out: 0
+                   }
+    }
+
+    fn clock_high(self: &mut Self) {
+        self.reg_write_out = self.reg_write_in;
+        self.mem_to_reg_out = self.mem_to_reg_in;
+        self.mem_write_out = self.mem_write_in;
+        self.branch_out = self.branch_in;
+        self.alu_control_out = self.alu_control_in;
+        self.alu_src_a_out = self.alu_src_a_in;
+        self.alu_src_b_out = self.alu_src_b_in;
+        self.pc_out = self.pc_in;
+        self.rd_1_out = self.rd_1_in;
+        self.rd_2_out = self.rd_2_in;
+        self.immed_out = self.immed_in;
+        self.wd_out = self.wd_in;
+    }
 }
 
 struct EMRegister {
-    reg_write_in       : bool,
-    mem_to_reg_in      : bool,
-    mem_write_in       : bool,
-    branch_in          : bool,
-    eq_comp_in         : bool,
-    alu_out_in         : i32,
-    rd_2_in            : u32,
-    rd_in              : u32,
+    reg_write_in    : bool,
+    mem_to_reg_in   : bool,
+    mem_write_in    : bool,
+    branch_in       : bool,
+    eq_comp_in      : bool,
+    alu_out_in      : i32,
+    rd_2_in         : u32,
+    rd_in           : u32,
+    wd_in           : u32,
 
-    reg_write_out       : bool,
-    mem_to_reg_out      : bool,
-    mem_write_out       : bool,
-    branch_out          : bool,
-    eq_comp_out         : bool,
-    alu_out_out         : i32,
-    rd_2_out            : u32,
-    rd_out              : u32,
+    reg_write_out   : bool,
+    mem_to_reg_out  : bool,
+    mem_write_out   : bool,
+    branch_out      : bool,
+    eq_comp_out     : bool,
+    alu_out_out     : i32,
+    rd_2_out        : u32,
+    rd_out          : u32,
+    wd_out          : u32
+}
+
+impl EMRegister {
+    fn new() -> EMRegister {
+        EMRegister { reg_write_in: false
+                   , mem_to_reg_in: false
+                   , mem_write_in: false
+                   , branch_in: false
+                   , eq_comp_in: false
+                   , alu_out_in: 0
+                   , rd_2_in: 0
+                   , rd_in: 0
+                   , wd_in: 0
+                   , reg_write_out: false
+                   , mem_to_reg_out: false
+                   , mem_write_out: false
+                   , branch_out: false
+                   , eq_comp_out: false
+                   , alu_out_out: 0
+                   , rd_2_out: 0
+                   , rd_out: 0
+                   , wd_out: 0
+                   }
+    }
+
+    fn clock_high(self: &mut Self) {
+        self.reg_write_out = self.reg_write_in;
+        self.mem_to_reg_out = self.mem_to_reg_in;
+        self.mem_write_out = self.mem_write_in;
+        self.branch_out = self.branch_in;
+        self.eq_comp_out = self.eq_comp_in;
+        self.alu_out_out = self.alu_out_in;
+        self.rd_2_out = self.rd_2_in;
+        self.rd_out = self.rd_in;
+        self.wd_out = self.wd_in;
+    }
 }
 
 struct MWRegister {
-    reg_write_in       : bool,
-    mem_to_reg_in      : bool,
-    alu_out_in         : u32,
-    read_data_in       : u32,
-    rd_in              : u32, 
+    reg_write_in    : bool,
+    mem_to_reg_in   : bool,
+    alu_out_in      : u32,
+    read_data_in    : u32,
+    rd_in           : u32, 
 
-    reg_write_out       : bool,
-    mem_to_reg_out      : bool,
-    alu_out_out         : u32,
-    read_data_out       : u32,
-    rd_out              : u32, 
+    reg_write_out   : bool,
+    mem_to_reg_out  : bool,
+    alu_out_out     : u32,
+    read_data_out   : u32,
+    rd_out          : u32, 
+}
+
+impl MWRegister {
+    fn new() -> MWRegister {
+        MWRegister { reg_write_in: false
+                   , mem_to_reg_in: false
+                   , alu_out_in: 0
+                   , read_data_in: 0
+                   , rd_in: 0
+                   , reg_write_out: false
+                   , mem_to_reg_out: false
+                   , alu_out_out: 0
+                   , read_data_out: 0
+                   , rd_out: 0
+                   }
+    }
+
+    fn clock_high(self: &mut Self) {
+        self.reg_write_out = self.reg_write_in;
+        self.mem_to_reg_out = self.mem_to_reg_in;
+        self.alu_out_out = self.alu_out_in;
+        self.read_data_out = self.read_data_in;
+        self.rd_out = self.rd_in;
+    }
 }
 
 struct WFRegister {
-    pc_in             : u32,
+    pc_in   : u32,
 
-    pc_out              : u32,
+    pc_out  : u32,
+}
+
+impl WFRegister {
+    fn new(base_address: u32) -> WFRegister {
+        WFRegister {pc_in: base_address, pc_out: base_address}
+    }
+
+    fn clock_high(self: &mut Self) {
+        self.pc_out = self.pc_in;
+    }
 }
 
 // BEGIN HELPERS
@@ -403,13 +643,6 @@ fn alu_comp(alu_control: u32, alu_in_a: i32, alu_in_b: i32) -> Result<i32> {
     })
 }
 
-fn get_bits(hi: u32, lo: u32, word: u32) -> u32 {
-   (word >> lo) & (2_u32.pow(hi-lo)-1)
-}
-
-fn splice_bits(hi: u32, lo: u32, dest: u32, source: u32) -> u32 {
-    ((source & (2_u32.pow(hi-lo)-1)) << lo) | dest
-}
 
 fn mux2(control: u32, a_in: u32, b_in: u32) -> Result<u32> {
     Ok(match control {
@@ -433,8 +666,7 @@ fn immed_gen(op_code: OpCode, inA: u32, inB: u32) -> i32 {
             dest_word = splice_bits(10, 5, dest_word, bits_10_to_5);
             dest_word = splice_bits(4, 1, dest_word, bits_4_to_1);
             dest_word = splice_bits(11, 11, dest_word, bit_11);
-            
-            dest_word as i32
+            twos_complement(dest_word, 13)
         },
         OpCode::SW => {
             let reconstructed = (inA << 20) | inB;
@@ -446,12 +678,13 @@ fn immed_gen(op_code: OpCode, inA: u32, inB: u32) -> i32 {
     }
 }
 // END HELPERS
+
 fn main() {
     println!("Hello, world!");
-    let mut register_file = RegisterFile::new();
-    register_file.initialize_register(10, 0x1001_0000);
-    register_file.initialize_register(11, 0x1001_0014);
-    register_file.initialize_register(12, 0x1212_1212);
-    register_file.initialize_register(13, 0x0000_0000);
-    register_file.initialize_register(14, 0x1414_1414);
+    let base_address: u32 = 0;
+    let instruction_list = assembler::from_file("/home/alexj/rust/risc-v-emulator/test-files/program-2.rsv");
+    let mut vm = Rv64Vm::from_instructions(instruction_list, base_address);
+    vm.execute_program();
+    println!("Register file:\n {}", vm.register_file);
 }
+
