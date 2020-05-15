@@ -1,0 +1,34 @@
+
+# Initialize a pointer
+addi x20, x0, 100
+
+# Value to write
+addi x21, x0, 16
+
+# Write the value
+sw x21, 0(x20)
+
+# 0th ancestor
+lw      x1, 0(x20)
+addi    x2, x1, 16
+
+# 1st ancestor
+lw      x3, 0(x20)
+nop
+addi    x4, x3, 16
+
+# 2nd ancestor
+lw      x5, 0(x20)
+nop
+nop
+addi    x6, x5, 16
+
+nop
+nop
+nop
+nop
+halt
+nop
+nop
+nop
+nop

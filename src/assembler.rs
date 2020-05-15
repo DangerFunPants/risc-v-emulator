@@ -12,15 +12,23 @@ use nom::bytes::complete::{take_while1, take, tag, tag_no_case, take_while};
 use nom::character::complete::{space1, space0};
 use nom::sequence::tuple;
 use nom::branch::alt;
-use nom::combinator::{map_res, opt};
+use nom::combinator::{map_res, opt, peek};
 use nom::error::{ErrorKind};
 use std::str::FromStr;
+
+enum LineContent {
+    Instruction(Instruction),
+    Comment,
+    Label(Label),
+    BlankLine,
+}
 
 #[derive(Debug)]
 enum Instruction {
     AddI(Register, Register, i32),
     RType(Register, Register, Register, Operation),
     Lw(Register, Register, i32),
+    Sw(Register, Register, i32),
     Beq(Register, Register, Label),
     LabelLine(Label), 
     Halt,
@@ -32,8 +40,14 @@ impl fmt::Display for Instruction {
             Instruction::AddI(r1, r2, i) => write!(f, "addi {} {} {}", r1, r2, i),
             Instruction::Lw(r1, r2, offset) => write!(f, "lw {} {} {}", r1, r2, offset),
             Instruction::Beq(r1, r2, label) => write!(f, "beq {} {} {}", r1, r2, label),
-            Instruction::RType(r1, r2, r3, Operation::Add) => write!(f, "add {} {} {}", r1, r2, r3),
-            Instruction::RType(r1, r2, r3, Operation::Slt) => write!(f, "slt {} {} {}", r1, r2, r3),
+            Instruction::RType(r1, r2, r3, operation) => {
+                match operation {
+                    Operation::Add => write!(f, "add {} {} {}", r1, r2, r3),
+                    Operation::Slt => write!(f, "slt {} {} {}", r1, r2, r3),
+                    Operation::Mul => write!(f, "mul {} {} {}", r1, r2, r3),
+                }
+            },
+            Instruction::Sw(r1, r2, offset) => write!(f, "sw {} {}({})", r1, offset, r2),
             Instruction::Halt => write!(f, "halt"),
             Instruction::LabelLine(label) => write!(f, "{}", label),
         };
@@ -49,8 +63,7 @@ impl Instruction {
                 let dest = splice_bits(19, 15, dest, *r2);
                 let dest = splice_bits(14, 12, dest, 0);
                 let dest = splice_bits(11, 7, dest, *r1);
-                let dest = splice_bits(6, 0, dest, 0b0010011);
-                dest
+                splice_bits(6, 0, dest, 0b0010011)
             },
 
             Instruction::Lw(Register(r1), Register(r2), offset) => {
@@ -58,9 +71,17 @@ impl Instruction {
                 let dest = splice_bits(19, 15, dest, *r2);
                 let dest = splice_bits(14, 12, dest, 0b010);
                 let dest = splice_bits(11, 7, dest, *r1);
-                let dest = splice_bits(6, 0, dest, 0b0000011);
-                dest
+                splice_bits(6, 0, dest, 0b0000011)
             },
+
+            Instruction::Sw(Register(r1), Register(r2), offset) => {
+                let dest = splice_bits(31, 25, 0, get_bits(11, 5, *offset as u32));
+                let dest = splice_bits(24, 20, dest, *r1);
+                let dest = splice_bits(19, 15, dest, *r2);
+                let dest = splice_bits(14, 12, dest, 0b010);
+                let dest = splice_bits(11, 7, dest, get_bits(4, 0, *offset as u32));
+                splice_bits(6, 0, dest, 0b0100011)
+            }
 
             Instruction::Beq(Register(r1), Register(r2), label) => {
                 let label_loc = match label_dict.get(label) {
@@ -68,6 +89,7 @@ impl Instruction {
                     None => panic!("Tried to branch to unknown label"),
                 };
                 let branch_offset: u32 = (((*label_loc as i32) - (offset as i32)) * 4) as u32;
+                println!("BEQ branch offset: {}", branch_offset as i32);
                 let bit_31 = get_bits(12, 12, branch_offset as u32);
                 let bits_30_to_25 = get_bits(10, 5, branch_offset);
                 let bits_11_to_8 = get_bits(4, 1, branch_offset);
@@ -80,22 +102,21 @@ impl Instruction {
                 let dest = splice_bits(14, 12, dest, 0b000);
                 let dest = splice_bits(11, 8, dest, bits_11_to_8);
                 let dest = splice_bits(7, 7, dest, bit_7);
-                let dest = splice_bits(6, 0, dest, 0b1100011);
-                dest
+                splice_bits(6, 0, dest, 0b1100011)
             },
 
             Instruction::RType(Register(r1), Register(r2), Register(r3), operation) => {
                 let op_indicator = match operation {
                     Operation::Add => 0b000,
                     Operation::Slt => 0b010,
+                    Operation::Mul => 0b001,
                 };
                 let dest = splice_bits(31, 25, 0, 0);
                 let dest = splice_bits(24, 20, dest, *r3);
                 let dest = splice_bits(19, 15, dest, *r2);
                 let dest = splice_bits(14, 12, dest, op_indicator);
                 let dest = splice_bits(11, 7, dest, *r1);
-                let dest = splice_bits(6, 0, dest, 0b0110011);
-                dest
+                splice_bits(6, 0, dest, 0b0110011)
             },
 
             Instruction::Halt => 0,
@@ -109,6 +130,7 @@ impl Instruction {
 enum Operation {
     Slt,
     Add,
+    Mul,
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
@@ -190,6 +212,11 @@ fn instruction(input: &str) -> IResult<&str, Instruction> {
             (input, Instruction::Lw(r1, r2, offset))
         },
 
+        "sw" => {
+            let (input, (r1, (r2, offset))) = tuple((register, register_with_offset))(input)?;
+            (input, Instruction::Sw(r1, r2, offset))
+        },
+
         "beq" => {
             let (input, (r1, r2, label)) = tuple((register, register, label))(input)?;
             (input, Instruction::Beq(r1, r2, label))
@@ -198,6 +225,11 @@ fn instruction(input: &str) -> IResult<&str, Instruction> {
         "add" => {
             let (input, (r1, r2, r3)) = tuple((register, register, register))(input)?;
             (input, Instruction::RType(r1, r2, r3, Operation::Add))
+        },
+
+        "mul" => {
+            let (input, (r1, r2, r3)) = tuple((register, register, register))(input)?;
+            (input, Instruction::RType(r1, r2, r3, Operation::Mul))
         },
 
         "nop" => {
@@ -212,18 +244,55 @@ fn instruction(input: &str) -> IResult<&str, Instruction> {
     })
 }
 
+fn comment(input: &str) -> IResult<&str, ()> {
+    let (input, _) = tag("#")(input)?;
+    Ok((input, ()))
+}
+
+fn blank_line(input: &str) -> IResult<&str, ()> {
+    let (input, _) = space1(input)?;
+    Ok((input, ()))
+}
+
+fn source_file_line(input: &str) -> IResult<&str, LineContent> {
+    if let Ok(_) = peek(instruction)(input) {
+        let (input, instruction) = instruction(input)?;
+        return Ok((input, LineContent::Instruction(instruction)));
+    }
+
+    if let Ok(_) = peek(label)(input) {
+        let (input, label) = label(input)?;
+        return Ok((input, LineContent::Label(label)));
+    } 
+
+    if let Ok(_) = peek(comment)(input) {
+        let (input, _) = comment(input)?;
+        return Ok((input, LineContent::Comment));
+    }
+
+    if let Ok(_) = peek(blank_line)(input) {
+        let (input, _) = blank_line(input)?;
+        return Ok((input, LineContent::BlankLine));
+    }
+
+    Ok((input, LineContent::BlankLine))
+}
+
 fn label_line(input: &str) -> IResult<&str, Instruction> {
     let (input, label) = label(input)?;
     Ok((input, Instruction::LabelLine(label)))
 }
 
 fn program(input: &str) -> IResult<&str, Vec<Instruction>> {
-    let instruction_or_label = alt((instruction, label_line));
     let mut input_out = "";
     let mut instructions = Vec::new();
     for line in input.lines() {
-        let (input, instruction) = instruction_or_label(line)?;
-        instructions.push(instruction);
+        let (input, line_contents) = source_file_line(line)?;
+        match line_contents {
+            LineContent::Instruction(instruction) => instructions.push(instruction),
+            LineContent::Label(label) => instructions.push(Instruction::LabelLine(label)),
+            _ => {},
+        };
         input_out = input;
     }
 

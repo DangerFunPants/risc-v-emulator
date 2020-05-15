@@ -1,0 +1,24 @@
+# 0 ancestors
+addi x1, x0, 16
+addi x2, x1, 16
+
+# 1 ancestor
+addi x3, x0, 16
+nop
+addi x4, x3, 16
+
+
+# 2 ancestors
+addi x5, x0, 16
+nop
+nop
+addi x6, x5, 16
+
+nop
+nop
+nop
+halt
+nop
+nop
+nop
+nop

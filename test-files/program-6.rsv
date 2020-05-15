@@ -1,0 +1,41 @@
+
+# Program to compute fact(n)
+# x1: n
+# x2: i
+# x3: acc
+# 
+# u32 i = 2;
+# u32 acc = 1;
+# while (i <= n) {
+#     acc = acc * i;
+#     i = i + 1;
+# }
+
+addi    x1, x0, 5
+addi    x1, x1, 1
+
+addi    x2, x0, 2
+addi    x3, x0, 1
+
+.L1:
+addi    x5, x0, 0
+slt     x5, x2, x1
+beq     x5, x0, .L2
+
+mul     x3, x3, x2
+addi    x2, x2, 1
+
+beq     x0, x0, .L1
+
+.L2:
+
+nop
+nop
+nop
+nop
+halt
+nop
+nop
+nop
+nop
+

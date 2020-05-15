@@ -116,11 +116,13 @@ impl DataMemory {
     }
 
     fn clock_low(self: &mut Self) {
+        println!("Data memory read location: {}", self.a);
         self.rd = *self.memory.entry(self.a).or_insert(0);
     }
     
     fn clock_high(self: &mut Self) {
         if self.we {
+            println!("Writing {} to address {}", self.wd, self.a);
             self.memory.insert(self.a, self.wd);
         }
     }
@@ -144,8 +146,12 @@ struct RegisterFile {
 
 impl fmt::Display for RegisterFile {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        for (reg_num, reg_val) in self.registers.iter() {
-            writeln!(f, "X{}: 0x{:x}", reg_num, reg_val);
+        println!("Register File:");
+        for reg_num in 0..31_u16 {
+            if self.registers.contains_key(&reg_num) {
+                let reg_result = self.registers.get(&reg_num).unwrap();
+                writeln!(f, "x{:2}: 0x{:x}", reg_num, reg_result);
+            }
         }
         Ok(())
     }
@@ -215,14 +221,15 @@ impl RegisterFile {
 }
 
 struct Rv64Vm {
-    fd_register         : FDRegister,
-    de_register         : DERegister,
-    em_register         : EMRegister,
-    mw_register         : MWRegister,
-    wf_register         : WFRegister,
-    instruction_memory  : InstructionMemory,
-    data_memory         : DataMemory,
-    register_file       : RegisterFile,
+    fd_register             : FDRegister,
+    de_register             : DERegister,
+    em_register             : EMRegister,
+    mw_register             : MWRegister,
+    wf_register             : WFRegister,
+    instruction_memory      : InstructionMemory,
+    data_memory             : DataMemory,
+    register_file           : RegisterFile,
+    last_cycle_was_stall    : bool,
 }
 
 enum Rv64VmState {
@@ -249,6 +256,7 @@ impl Rv64Vm {
                , instruction_memory: imem
                , data_memory: dmem
                , register_file
+               , last_cycle_was_stall: false
                }
     }
 
@@ -274,6 +282,8 @@ impl Rv64Vm {
         self.execute_stage();
         self.mem_stage();
         
+        // In the case that we branch, invalidate the last 3 instructions in 
+        // the pipeline. 
         if is_branch {
             self.fd_register.instruction_in = 0x13; // NOP
 
@@ -284,17 +294,86 @@ impl Rv64Vm {
             self.em_register.mem_write_in = false;
             self.em_register.reg_write_in = false;
             self.em_register.branch_in = false;
-
-            self.mw_register.reg_write_in = false;
-            self.em_register.branch_in = false
         }
 
-        self.fd_register.clock_high();
-        self.de_register.clock_high();
+        let src_reg_1 = get_bits(19, 15, self.fd_register.instruction_out);
+        let src_reg_2 = get_bits(24, 20, self.fd_register.instruction_out);
+        let exec_write_reg = self.de_register.wd_out;
+        let mem_write_reg = self.em_register.wd_out;
+
+        let mut src_reg_1_forwarded = false;
+        let mut src_reg_2_forwarded = false;
+        let mut should_stall_for_lw = false;
+
+        // I don't like that this is up here and not with the rest of the clock high calls. Putting
+        // it here so that we can forward data memory read results from 2 removed ancestors.
+        self.data_memory.clock_high();
+        
+        // Check if we need to forward the ALU result to either of the source registers.
+        if self.de_register.reg_write_out {
+            // Forward from the ALU
+            if !self.de_register.mem_to_reg_out {
+                if exec_write_reg == src_reg_1 {
+                    self.de_register.rd_1_in = self.em_register.alu_out_in as u32;
+                    src_reg_1_forwarded = true;
+                }
+                if exec_write_reg == src_reg_2 {
+                    self.de_register.rd_2_in = self.em_register.alu_out_in as u32;
+                    src_reg_2_forwarded = true;
+                }
+            } else {
+                // Can't actually "forward" here, need to stall. 
+                // This means that there is a lw in the execute stage that is loading into a
+                // register that is a source for the current instruction.
+                //
+                // This is actually incorrect though since we could end up stalling and wasting a
+                // cycle for instructions that don't actually have two source registers.
+                // All instructions have src_reg_1, only R-type, SW and BEQ have src_reg_2.
+                if exec_write_reg == src_reg_1 || exec_write_reg == src_reg_2 {
+                    should_stall_for_lw = true;
+                }
+            }
+        }
+
+        // This is actually somewhat tedious. We could have one source register coming from 
+        // the first ancestor and another source register coming from the second ancestor, need
+        // to handle that case. 
+        if self.em_register.reg_write_out {
+            if !self.em_register.mem_to_reg_out {
+                if mem_write_reg == src_reg_1 && !src_reg_1_forwarded {
+                    self.de_register.rd_1_in = self.em_register.alu_out_out as u32;     
+                }
+                if mem_write_reg == src_reg_2 && !src_reg_2_forwarded {
+                    self.de_register.rd_2_in = self.em_register.alu_out_out as u32;
+                }
+            } else {
+                // Forward from DMEM.
+                if mem_write_reg == src_reg_1 && !src_reg_1_forwarded {
+                    self.de_register.rd_1_in = self.mw_register.read_data_in;
+                }
+                if mem_write_reg == src_reg_2 && !src_reg_2_forwarded {
+                    self.de_register.rd_2_in = self.mw_register.read_data_in;
+                }
+            }
+        }
+
+        // I'm not certain that this makes sense. We set clock high for these registers
+        // in the case that we're not stalling or in the case that we stalled last cycle. We don't
+        // stall in the case that we stalled in the last cycle since we need to move the LW from 
+        // decode into execute stage, and since the lw in the execute can't cause another data
+        // hazard with the instruction that moves into decode, we don't need to worry about
+        // stalling again.
+        if !should_stall_for_lw || self.last_cycle_was_stall {
+            self.fd_register.clock_high();
+            self.de_register.clock_high();
+            self.wf_register.clock_high();
+            self.last_cycle_was_stall = false;
+        } else {
+            self.last_cycle_was_stall = true;
+        }
+
         self.em_register.clock_high();
         self.mw_register.clock_high();
-        self.wf_register.clock_high();
-        self.data_memory.clock_high();
 
         Ok(match op_code {
             OpCode::HALT => Rv64VmState::Halted,
@@ -304,7 +383,7 @@ impl Rv64Vm {
 
     fn writeback_stage(self: &mut Self) -> Result<bool> {
         // BEGIN WB
-        println!("Alu out: {:x}", self.mw_register.alu_out_out);
+        println!("Alu out in writeback: {:x}", self.mw_register.alu_out_out);
         let result = mux2(self.mw_register.mem_to_reg_out as u32, self.mw_register.alu_out_out, 
                           self.mw_register.read_data_out)?;
         self.register_file.set_a3(self.mw_register.rd_out as u16);
@@ -350,7 +429,8 @@ impl Rv64Vm {
             Ok(op_code) => op_code,
             Err(op_err) => return Err(op_err),
         };
-        println!("op code is {:?}", op_code);
+        let wd = get_bits(11, 7, instr);
+        println!("op code is {:?}, dst_reg: {}", op_code, wd);
 
         let (reg_write, mem_to_reg, mem_write, branch, alu_control, alu_src_b, alu_src_a) = 
             match op_code {
@@ -364,10 +444,6 @@ impl Rv64Vm {
 
         let immed = immed_gen(op_code, get_bits(31, 20, instr), get_bits(11, 0, instr));
         println!("Immediate value is: {}", immed);
-        let wd = get_bits(11, 7, instr);
-        if op_code == OpCode::BEQ {
-            println!("rd1: {:x}, rd2: {:x}", rd_1, rd_2);
-        }
         
         self.de_register.reg_write_in = reg_write;
         self.de_register.mem_to_reg_in = mem_to_reg;
@@ -393,9 +469,12 @@ impl Rv64Vm {
         let eq_comp = self.de_register.rd_1_out == self.de_register.rd_2_out;
 
         let alu_in_a = mux2(self.de_register.alu_src_a_out, self.de_register.pc_out, self.de_register.rd_1_out)?;
+        println!("pc_out: {}, rd_1_out: {}", self.de_register.pc_out, self.de_register.rd_1_out);
         let alu_in_b = mux2(self.de_register.alu_src_b_out, 
                             self.de_register.rd_2_out, self.de_register.immed_out)?;
         let alu_out = alu_comp(self.de_register.alu_control_out, alu_in_a as i32, alu_in_b as i32)?;
+        println!("alu_in_a: {}, alu_in_b: {}", alu_in_a, alu_in_b);
+        println!("ALU out in exec stage {}", alu_out);
         let rd_2 = self.de_register.rd_2_out;
         let rd_1 = self.de_register.rd_1_out;
         
@@ -638,6 +717,7 @@ impl WFRegister {
 fn alu_comp(alu_control: u32, alu_in_a: i32, alu_in_b: i32) -> Result<i32> {
     Ok(match alu_control {
         0b000 => alu_in_a + alu_in_b,
+        0b001 => alu_in_a * alu_in_b,
         0b010 => if alu_in_a < alu_in_b {1} else {0},
         _ => return Err(Error::InvalidAluControl(alu_control)),
     })
@@ -682,9 +762,9 @@ fn immed_gen(op_code: OpCode, inA: u32, inB: u32) -> i32 {
 fn main() {
     println!("Hello, world!");
     let base_address: u32 = 0;
-    let instruction_list = assembler::from_file("/home/alexj/rust/risc-v-emulator/test-files/program-2.rsv");
+    let instruction_list = assembler::from_file("/home/alexj/rust/risc-v-emulator/test-files/program-8.rsv");
     let mut vm = Rv64Vm::from_instructions(instruction_list, base_address);
     vm.execute_program();
-    println!("Register file:\n {}", vm.register_file);
+    println!("{}", vm.register_file);
 }
 

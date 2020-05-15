@@ -1,0 +1,54 @@
+# Program to compute the product of array elements (array initialized elsewhere)
+
+# u8* arr;  // arr
+# int n;    // len of arr
+# int acc = 1
+# u8* p = arr;
+# u8* guard = p + n;
+# 
+# while p < guard {
+#     int val = *p;
+#     acc = acc * val;
+#     p += 1;
+# }
+
+# x1 : arr
+# x2 : n
+# x3 : acc
+# x4 : p
+# x5 : guard
+# x6 : val
+
+addi    x1, x0, 100
+addi    x2, x0, 5
+addi    x3, x0, 1
+addi    x4, x1, 0
+
+addi    x8, x0, 4
+mul     x7, x2, x8
+
+add     x5, x4, x7
+
+.L1:
+
+slt     x9, x4, x5
+beq     x9, x0, .L2
+
+lw      x6, 0(x4)
+addi    x4, x4, 4
+mul     x3, x3, x6
+
+
+beq x0, x0, .L1
+
+.L2:
+
+nop
+nop
+nop
+nop
+halt
+nop
+nop
+nop
+nop
