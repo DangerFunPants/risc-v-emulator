@@ -1,3 +1,6 @@
+
+#[macro_use] extern crate lalrpop_util;
+
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::fmt;
@@ -6,12 +9,17 @@ use crate::helpers::{get_bits, splice_bits, twos_complement};
 
 mod assembler;
 mod helpers;
+mod assembly_parser;
+mod assembler_ast;
 
 #[cfg(tests)]
 mod nom_tests;
 
 #[cfg(tests)]
 mod helper_tests;
+
+#[cfg(tests)]
+mod assembly_parser_tests;
 
 #[derive(Debug)]
 pub enum Rv64VmError {
@@ -733,9 +741,9 @@ fn mux2(control: u32, a_in: u32, b_in: u32) -> Result<u32> {
 }
 
 fn immed_gen(op_code: OpCode, inA: u32, inB: u32) -> i32 {
+    let reconstructed = (inA << 20) | inB;
     match op_code {
         OpCode::BEQ => {
-            let reconstructed  = (inA << 20) | inB;
             let bit_12 = get_bits(31, 31, reconstructed);
             let bits_10_to_5 = get_bits(30, 25, reconstructed);
             let bits_4_to_1 = get_bits(11, 8, reconstructed);
@@ -749,7 +757,6 @@ fn immed_gen(op_code: OpCode, inA: u32, inB: u32) -> i32 {
             twos_complement(dest_word, 13)
         },
         OpCode::SW => {
-            let reconstructed = (inA << 20) | inB;
             ((get_bits(31, 25, reconstructed) << 5) | get_bits(11, 7, reconstructed)) as i32
         },
         _ => {
@@ -767,4 +774,3 @@ fn main() {
     vm.execute_program();
     println!("{}", vm.register_file);
 }
-
